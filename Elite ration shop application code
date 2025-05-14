@@ -1,0 +1,278 @@
+// File: server.js
+const express = require('express');
+const mongoose = require('mongoose');
+const http = require('http');
+const socketIo = require('socket.io');
+const cors = require('cors');
+const bodyParser = require('body-parser');
+
+// Initialize Express app
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server);
+
+// Middleware
+app.use(cors());
+app.use(bodyParser.json());
+
+// MongoDB Connection
+mongoose.connect('mongodb://localhost:27017/elite_ration_db', {
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+})
+.then(() => console.log('Connected to MongoDB'))
+.catch(err => console.error('MongoDB connection error:', err));
+
+// Schema Definitions
+const userSchema = new mongoose.Schema({
+  name: String,
+  rationCardNumber: { type: String, unique: true },
+  aadharNumber: { type: String, unique: true },
+  phoneNumber: String,
+  fingerprintData: String, // Store encrypted fingerprint hash
+  address: String,
+  familyMembers: Number,
+  category: String, // BPL, APL, etc.
+  createdAt: { type: Date, default: Date.now }
+});
+
+const shopSchema = new mongoose.Schema({
+  name: String,
+  shopId: { type: String, unique: true },
+  ownerName: String,
+  phoneNumber: String,
+  email: String,
+  address: String,
+  deviceToken: String, // For push notifications
+  socketId: String // For real-time web socket connection
+});
+
+const productSchema = new mongoose.Schema({
+  name: String,
+  category: String,
+  price: Number,
+  unit: String, // kg, liter, etc.
+  availableQuantity: Number
+});
+
+const orderSchema = new mongoose.Schema({
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  shop: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop' },
+  items: [{
+    product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
+    quantity: Number,
+    price: Number
+  }],
+  totalPrice: Number,
+  status: {
+    type: String,
+    enum: ['Placed', 'Confirmed', 'Ready', 'Collected', 'Cancelled'],
+    default: 'Placed'
+  },
+  placedAt: { type: Date, default: Date.now }
+});
+
+// Create models
+const User = mongoose.model('User', userSchema);
+const Shop = mongoose.model('Shop', shopSchema);
+const Product = mongoose.model('Product', productSchema);
+const Order = mongoose.model('Order', orderSchema);
+
+// Socket.io connection management
+io.on('connection', (socket) => {
+  console.log('New client connected:', socket.id);
+  
+  // Shop login - associate socket ID with shop
+  socket.on('shopLogin', async (shopId) => {
+    try {
+      const shop = await Shop.findOneAndUpdate(
+        { shopId: shopId },
+        { socketId: socket.id },
+        { new: true }
+      );
+      
+      if (shop) {
+        console.log(`Shop ${shopId} logged in with socket ${socket.id}`);
+        socket.join(`shop_${shopId}`);
+      }
+    } catch (error) {
+      console.error('Error during shop login:', error);
+    }
+  });
+  
+  // Handle disconnection
+  socket.on('disconnect', async () => {
+    console.log('Client disconnected:', socket.id);
+    try {
+      await Shop.findOneAndUpdate(
+        { socketId: socket.id },
+        { socketId: null }
+      );
+    } catch (error) {
+      console.error('Error during disconnect handling:', error);
+    }
+  });
+});
+
+// Routes
+// User Authentication
+app.post('/api/authenticate', async (req, res) => {
+  try {
+    const { fingerprintData } = req.body;
+    // In a real app, you would verify the fingerprint using a secure method
+    // This is just a placeholder
+    const user = await User.findOne({ fingerprintData });
+    
+    if (!user) {
+      return res.status(401).json({ message: 'Authentication failed' });
+    }
+    
+    res.status(200).json({ 
+      message: 'Authentication successful',
+      userId: user._id
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Get Products
+app.get('/api/products', async (req, res) => {
+  try {
+    const products = await Product.find();
+    res.status(200).json(products);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Place Order
+app.post('/api/orders', async (req, res) => {
+  try {
+    const { userId, shopId, items } = req.body;
+    
+    // Calculate total price and validate quantities
+    let totalPrice = 0;
+    const orderItems = [];
+    
+    for (const item of items) {
+      const product = await Product.findById(item.productId);
+      if (!product || product.availableQuantity < item.quantity) {
+        return res.status(400).json({ 
+          message: `Insufficient quantity for ${product ? product.name : 'unknown product'}` 
+        });
+      }
+      
+      // Reduce available quantity
+      product.availableQuantity -= item.quantity;
+      await product.save();
+      
+      // Add to order items
+      orderItems.push({
+        product: item.productId,
+        quantity: item.quantity,
+        price: product.price
+      });
+      
+      totalPrice += product.price * item.quantity;
+    }
+    
+    // Find shop
+    const shop = await Shop.findOne({ shopId });
+    if (!shop) {
+      return res.status(404).json({ message: 'Shop not found' });
+    }
+    
+    // Create order
+    const newOrder = new Order({
+      user: userId,
+      shop: shop._id,
+      items: orderItems,
+      totalPrice
+    });
+    
+    await newOrder.save();
+    
+    // Populate order details for notification
+    const populatedOrder = await Order.findById(newOrder._id)
+      .populate('user', 'name rationCardNumber phoneNumber')
+      .populate('shop', 'name shopId')
+      .populate('items.product', 'name unit');
+    
+    // Send real-time notification via Socket.io
+    if (shop.socketId) {
+      io.to(shop.socketId).emit('newOrder', {
+        orderId: populatedOrder._id,
+        userName: populatedOrder.user.name,
+        rationCardNumber: populatedOrder.user.rationCardNumber,
+        totalItems: populatedOrder.items.length,
+        totalPrice: populatedOrder.totalPrice,
+        timestamp: populatedOrder.placedAt
+      });
+    }
+    
+    // Send response
+    res.status(201).json({ 
+      message: 'Order placed successfully',
+      orderId: newOrder._id
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Get Shop Orders
+app.get('/api/shops/:shopId/orders', async (req, res) => {
+  try {
+    const shop = await Shop.findOne({ shopId: req.params.shopId });
+    if (!shop) {
+      return res.status(404).json({ message: 'Shop not found' });
+    }
+    
+    const orders = await Order.find({ shop: shop._id })
+      .populate('user', 'name rationCardNumber phoneNumber')
+      .populate('items.product', 'name unit')
+      .sort({ placedAt: -1 });
+    
+    res.status(200).json(orders);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Update Order Status
+app.patch('/api/orders/:orderId/status', async (req, res) => {
+  try {
+    const { status } = req.body;
+    const validStatuses = ['Confirmed', 'Ready', 'Collected', 'Cancelled'];
+    
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({ message: 'Invalid status value' });
+    }
+    
+    const order = await Order.findByIdAndUpdate(
+      req.params.orderId,
+      { status },
+      { new: true }
+    );
+    
+    if (!order) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
+    
+    // Can notify user about status change here
+    
+    res.status(200).json({ 
+      message: 'Order status updated successfully',
+      order
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Start server
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
